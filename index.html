@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HoloWorld</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; }
+  #vid { display: none; }
+  canvas { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; }
+  #globe-cv { pointer-events: none; }
+  #ui {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 18px; z-index: 10;
+    background: #000; font-family: monospace;
+  }
+  #ui h1 {
+    color: #0ff; font-weight: 100; letter-spacing: 14px;
+    font-size: 30px; text-transform: uppercase;
+  }
+  #ui p { color: rgba(0,255,255,0.35); font-size: 10px; letter-spacing: 3px; text-align: center; line-height: 2; }
+  #start-btn {
+    padding: 13px 40px; background: transparent; color: #0ff;
+    border: 1px solid rgba(0,255,255,0.5); font-family: monospace;
+    font-size: 12px; letter-spacing: 5px; cursor: pointer; transition: background 0.2s;
+  }
+  #start-btn:hover  { background: rgba(0,255,255,0.07); }
+  #start-btn:disabled { opacity: 0.4; cursor: default; }
+  #status { color: rgba(0,255,255,0.45); font-size: 10px; letter-spacing: 2px; min-height: 14px; }
+</style>
+</head>
+<body>
+
+<video id="vid" playsinline></video>
+<canvas id="fx-cv"></canvas>
+<canvas id="globe-cv"></canvas>
+
+<div id="ui">
+  <h1>HoloWorld</h1>
+  <p>
+    SNAP RIGHT HAND → SPAWN GLOBE<br>
+    LEFT PINCH + DRAG → ROTATE &nbsp;|&nbsp; PINCH IN/OUT → ZOOM<br>
+    LEFT FIST → PAUSE SPIN &nbsp;|&nbsp; RIGHT FIST → DESPAWN
+  </p>
+  <button id="start-btn">INITIALIZE</button>
+  <span id="status"></span>
+</div>
+
+<!-- MediaPipe (classic scripts, non-module) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic/holistic.js" crossorigin="anonymous"></script>
+
+<!-- Three.js via importmap -->
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+const ORB_COUNT       = 260;
+const LERP_POS        = 0.13;    // globe position smoothing
+const AUTO_SPIN_RATE  = 0.0030;  // rad/frame
+const SNAP_LOAD_DIST  = 0.20;    // thumb-mid / palmSize → enter LOADED state
+const SNAP_FIRE_DIST  = 0.55;    // rapid separation → fire SNAP
+const SNAP_TIMEOUT_MS = 320;
+const FIST_FRAMES     = 14;      // consecutive frames to confirm fist despawn
+
+// Left hand pinch hysteresis — prevents rapid on/off flicker
+const PINCH_ON  = 0.36;   // normalized dist/palmSize → enter pinch
+const PINCH_OFF = 0.45;   // → exit pinch
+
+// MediaPipe hand landmark connections
+const HAND_CONNECTIONS = [
+  // Palm
+  [0,1],[0,5],[0,17],[5,9],[9,13],[13,17],
+  // Thumb
+  [1,2],[2,3],[3,4],
+  // Index
+  [5,6],[6,7],[7,8],
+  // Middle
+  [9,10],[10,11],[11,12],
+  // Ring
+  [13,14],[14,15],[15,16],
+  // Pinky
+  [17,18],[18,19],[19,20],
+];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LOOK-UP TABLES  (avoid Math.random / Math.sin per-frame at scale)
+// ═══════════════════════════════════════════════════════════════════════════════
+const RAND_LUT = Float32Array.from({ length: 4096 }, Math.random);
+const SIN_LUT  = Float32Array.from({ length: 1024 }, (_, i) => Math.sin(i / 1024 * Math.PI * 2));
+let _ri = 0;
+const rnd  = ()  => RAND_LUT[_ri++ & 4095];
+const sinL = (t) => SIN_LUT[((t * 162.97) & 1023) | 0];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DOM
+// ═══════════════════════════════════════════════════════════════════════════════
+const vid      = document.getElementById('vid');
+const fxCv     = document.getElementById('fx-cv');
+const globeCv  = document.getElementById('globe-cv');
+const ctx      = fxCv.getContext('2d');
+const statusEl = document.getElementById('status');
+const uiEl     = document.getElementById('ui');
+
+let W = innerWidth, H = innerHeight;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  THREE.JS — renderer + camera
+// ═══════════════════════════════════════════════════════════════════════════════
+const renderer = new THREE.WebGLRenderer({ canvas: globeCv, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);
+
+const scene = new THREE.Scene();
+
+// Orthographic camera: world units = screen pixels (1:1)
+const threeCamera = new THREE.OrthographicCamera(-W/2, W/2, H/2, -H/2, 1, 2000);
+threeCamera.position.z = 500;
+
+function resize() {
+  W = innerWidth; H = innerHeight;
+  fxCv.width  = W; fxCv.height  = H;
+  globeCv.width = W; globeCv.height = H;
+  threeCamera.left = -W/2; threeCamera.right  =  W/2;
+  threeCamera.top  =  H/2; threeCamera.bottom = -H/2;
+  threeCamera.updateProjectionMatrix();
+  renderer.setSize(W, H);
+}
+window.addEventListener('resize', resize);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  THREE.JS — globe scene objects
+// ═══════════════════════════════════════════════════════════════════════════════
+const globeGroup = new THREE.Group();
+scene.add(globeGroup);
+
+// -- Core sphere --
+const sphereMat = new THREE.MeshBasicMaterial({ color: 0x001528, transparent: true, opacity: 0 });
+globeGroup.add(new THREE.Mesh(new THREE.SphereGeometry(1, 56, 56), sphereMat));
+
+// -- Atmosphere halo (backside, additive) --
+const haloMat = new THREE.MeshBasicMaterial({
+  color: 0x0055cc, transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, side: THREE.BackSide, depthWrite: false,
+});
+globeGroup.add(new THREE.Mesh(new THREE.SphereGeometry(1.06, 24, 24), haloMat));
+
+// -- Latitude / longitude grid lines --
+const gridMat = new THREE.LineBasicMaterial({
+  color: 0x0088dd, transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+function buildGrid() {
+  const g = new THREE.Group();
+  const R = 1.005;
+  // Meridians every 20°
+  for (let lon = 0; lon < 360; lon += 20) {
+    const pts = [];
+    for (let lat = -90; lat <= 90; lat += 4) {
+      const phi = lat * Math.PI / 180, tht = lon * Math.PI / 180;
+      pts.push(new THREE.Vector3(
+        R * Math.cos(phi) * Math.cos(tht),
+        R * Math.sin(phi),
+        R * Math.cos(phi) * Math.sin(tht),
+      ));
+    }
+    g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gridMat));
+  }
+  // Parallels every 30°
+  for (let lat = -60; lat <= 60; lat += 30) {
+    const pts = [];
+    const phi = lat * Math.PI / 180;
+    for (let lon = 0; lon <= 362; lon += 4) {
+      const tht = lon * Math.PI / 180;
+      pts.push(new THREE.Vector3(
+        R * Math.cos(phi) * Math.cos(tht),
+        R * Math.sin(phi),
+        R * Math.cos(phi) * Math.sin(tht),
+      ));
+    }
+    g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gridMat));
+  }
+  return g;
+}
+globeGroup.add(buildGrid());
+
+// -- Equatorial glow ring --
+const eqRingMat = new THREE.MeshBasicMaterial({
+  color: 0x00ffff, transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+globeGroup.add(new THREE.Mesh(new THREE.TorusGeometry(1.02, 0.009, 8, 160), eqRingMat));
+
+// -- Orbital decoration rings --
+function makeRing(radius, color, rx, ry, rz) {
+  const mat = new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity: 0,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(new THREE.TorusGeometry(radius, 0.005, 6, 180), mat);
+  mesh.rotation.set(rx, ry, rz);
+  globeGroup.add(mesh);
+  return mat;  // return mat so we can update opacity
+}
+const ring1Mat = makeRing(1.32, 0x0077ff, Math.PI / 3,      0, 0);
+const ring2Mat = makeRing(1.50, 0x00ffaa, Math.PI / 5.5, 0.4, Math.PI / 6);
+
+// -- Orbit particles --
+const orbPhase = Float32Array.from({ length: ORB_COUNT }, () => Math.random() * Math.PI * 2);
+const orbTheta = Float32Array.from({ length: ORB_COUNT }, () => Math.random() * Math.PI * 2);
+const orbSpeed = Float32Array.from({ length: ORB_COUNT }, () =>
+  (Math.random() * 0.014 + 0.003) * (Math.random() < 0.5 ? 1 : -1));
+const orbRad   = Float32Array.from({ length: ORB_COUNT }, () => 1.18 + Math.random() * 0.5);
+const orbPos   = new Float32Array(ORB_COUNT * 3);
+const orbGeo   = new THREE.BufferGeometry();
+orbGeo.setAttribute('position', new THREE.BufferAttribute(orbPos, 3));
+const orbMat   = new THREE.PointsMaterial({
+  color: 0x00ddff, size: 2.5, sizeAttenuation: false,
+  transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+globeGroup.add(new THREE.Points(orbGeo, orbMat));
+
+// -- City data pins --
+const CITIES = [
+  [41.01, 28.97], [40.71, -74.01], [51.51, -0.13], [35.68, 139.69],
+  [-33.87, 151.21], [1.35, 103.82], [48.85, 2.35], [55.75, 37.62],
+];
+const pinMat = new THREE.MeshBasicMaterial({
+  color: 0xffee00, blending: THREE.AdditiveBlending, depthWrite: false,
+});
+const pinGroup = new THREE.Group();
+CITIES.forEach(([lat, lon]) => {
+  const phi = (90 - lat) * Math.PI / 180;
+  const tht = (lon + 180) * Math.PI / 180;
+  const r = 1.022;
+  const pin = new THREE.Mesh(new THREE.SphereGeometry(0.028, 6, 6), pinMat);
+  pin.position.set(
+    r * Math.sin(phi) * Math.cos(tht),
+    r * Math.cos(phi),
+    r * Math.sin(phi) * Math.sin(tht),
+  );
+  pinGroup.add(pin);
+});
+globeGroup.add(pinGroup);
+
+globeGroup.visible = false;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+let mpHands  = null;
+let mpPose   = null;
+
+let globeState   = 'IDLE';   // 'IDLE' | 'ACTIVE'
+let globeOpacity = 0;
+let globeRadius  = 80;       // in px (ortho world units)
+let zoomScale    = 1.0;
+let autoSpin     = true;
+const globeEuler = { x: 0, y: 0 };
+
+// Smoothed Three.js world position
+let gx = 0, gy = 0, gxRaw = 0, gyRaw = 0;
+
+// Snap state machine
+const snapSM = { phase: 'IDLE', t: 0 };   // phases: IDLE | LOADED | COOL
+const midBuf = new Array(4).fill(null);
+let midBufI  = 0;
+
+// Fist frame counter (hysteresis for despawn)
+let fistCount = 0;
+
+// Left hand grab
+let grabbing     = false;
+let grabAnchor   = null;
+let eulerAnchor  = null;
+let pinchAnchor  = 0;
+let zoomAnchor   = 1;
+let leftPinching = false;   // hysteresis state
+let leftFisting  = false;   // hysteresis state
+let leftFistCount = 0;
+
+// Spark burst on snap
+let sparks = null;
+
+// Scan line position (0→1)
+let scanT  = 0;
+let frameN = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+const d2d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function palmCtr(lms) {
+  return {
+    x: (lms[0].x + lms[5].x + lms[9].x + lms[17].x) * 0.25,
+    y: (lms[0].y + lms[5].y + lms[9].y + lms[17].y) * 0.25,
+  };
+}
+function palmSz(lms) { return d2d(lms[0], lms[9]); }
+
+// Normalized landmark → mirrored screen coords
+const lsX = (lm) => (1 - lm.x) * W;
+const lsY = (lm) => lm.y * H;
+
+// Screen px → Three.js ortho world
+const s2tx = (sx) => sx - W * 0.5;
+const s2ty = (sy) => H * 0.5 - sy;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SNAP DETECTOR  — two-phase state machine
+// ═══════════════════════════════════════════════════════════════════════════════
+function detectSnap(hand, ps) {
+  const d = d2d(hand[4], hand[12]) / ps;
+  midBuf[midBufI++ & 3] = { x: hand[12].x, y: hand[12].y, t: performance.now() };
+
+  if (snapSM.phase === 'IDLE') {
+    if (d < SNAP_LOAD_DIST) { snapSM.phase = 'LOADED'; snapSM.t = performance.now(); }
+    return false;
+  }
+
+  if (snapSM.phase === 'LOADED') {
+    if (performance.now() - snapSM.t > SNAP_TIMEOUT_MS) { snapSM.phase = 'IDLE'; return false; }
+    if (d > SNAP_FIRE_DIST) {
+      const b0 = midBuf[(midBufI - 1) & 3];
+      const b2 = midBuf[(midBufI - 3) & 3];
+      let vel = 0;
+      if (b0 && b2 && b2.t < b0.t) {
+        const dt = (b0.t - b2.t) / 1000 + 1e-9;
+        vel = Math.hypot(b0.x - b2.x, b0.y - b2.y) / dt / ps;
+      }
+      // Fire if finger moved fast enough OR gesture was very quick
+      if (vel > 0.35 || (performance.now() - snapSM.t) < 180) {
+        snapSM.phase = 'COOL';
+        setTimeout(() => { snapSM.phase = 'IDLE'; }, 1000);
+        return true;
+      }
+      snapSM.phase = 'IDLE';
+    }
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FIST DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+function isFist(hand, pc, ps) {
+  let sum = 0;
+  for (const i of [4, 8, 12, 16, 20]) sum += d2d(hand[i], pc);
+  return (sum / 5 / ps) < 0.52;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEFT HAND CONTROLLER  — virtual trackball + zoom + pause
+// ═══════════════════════════════════════════════════════════════════════════════
+function processLeftHand(hand, ps) {
+  if (!hand) { grabbing = false; leftPinching = false; leftFisting = false; return; }
+
+  const pc     = palmCtr(hand);
+  const pinchD = d2d(hand[4], hand[8]) / ps;
+
+  // Pinch hysteresis
+  if (!leftPinching && pinchD < PINCH_ON)  leftPinching = true;
+  if ( leftPinching && pinchD > PINCH_OFF) { leftPinching = false; grabbing = false; }
+
+  // Fist hysteresis (separate counter for left hand)
+  const fistNow = isFist(hand, pc, ps);
+  if (fistNow) { leftFistCount = Math.min(leftFistCount + 1, 10); }
+  else         { leftFistCount = Math.max(leftFistCount - 2, 0);  }
+  leftFisting = leftFistCount >= 6;
+
+  // Fist = pause auto-spin (only when globe active)
+  if (globeState === 'ACTIVE') autoSpin = !leftFisting;
+
+  // Trackball + zoom only when globe active
+  if (globeState !== 'ACTIVE') return;
+
+  if (leftPinching && !grabbing) {
+    // Grab start — anchor current state
+    grabbing    = true;
+    grabAnchor  = { x: lsX(pc), y: lsY(pc) };
+    eulerAnchor = { x: globeEuler.x, y: globeEuler.y };
+    pinchAnchor = pinchD;
+    zoomAnchor  = zoomScale;
+  } else if (leftPinching && grabbing) {
+    // Trackball rotate
+    const cx = lsX(pc), cy = lsY(pc);
+    globeEuler.y = eulerAnchor.y + (cx - grabAnchor.x) * 0.005;
+    globeEuler.x = eulerAnchor.x + (cy - grabAnchor.y) * 0.005;
+    // Zoom via pinch spread/squeeze
+    zoomScale = Math.max(0.35, Math.min(3.5, zoomAnchor + (pinchAnchor - pinchD) * 3.8));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEFT HAND SKELETON DRAW
+// ═══════════════════════════════════════════════════════════════════════════════
+function drawLeftHand(hand) {
+  if (!hand) return;
+  const ps = palmSz(hand);
+  const pc = palmCtr(hand);
+
+  // Gesture state → color scheme
+  let baseColor, jointColor, lineW;
+  if (leftFisting) {
+    // Fist: orange — spin paused
+    baseColor  = 'rgba(255,120,0,';
+    jointColor = 'rgba(255,160,40,';
+    lineW = 1.5;
+  } else if (leftPinching) {
+    // Pinch / grab active: bright cyan
+    baseColor  = 'rgba(0,255,220,';
+    jointColor = 'rgba(0,255,255,';
+    lineW = 2.0;
+  } else {
+    // Idle: dim cyan
+    baseColor  = 'rgba(0,160,220,';
+    jointColor = 'rgba(0,200,255,';
+    lineW = 1.2;
+  }
+
+  // Skeleton connections
+  ctx.lineWidth = lineW;
+  for (const [a, b] of HAND_CONNECTIONS) {
+    const ax = lsX(hand[a]), ay = lsY(hand[a]);
+    const bx = lsX(hand[b]), by = lsY(hand[b]);
+    ctx.strokeStyle = baseColor + '0.65)';
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+  }
+
+  // Joint dots
+  for (let i = 0; i < 21; i++) {
+    const x = lsX(hand[i]), y = lsY(hand[i]);
+    const isTip = [4,8,12,16,20].includes(i);
+    const r = isTip ? 4 : 2.5;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = jointColor + (isTip ? '0.9)' : '0.6)');
+    ctx.fill();
+  }
+
+  // Pinch indicator: line + dot between thumb and index tip
+  const tx = lsX(hand[4]), ty = lsY(hand[4]);
+  const ix = lsX(hand[8]), iy = lsY(hand[8]);
+  const pinchD = d2d(hand[4], hand[8]) / ps;
+  const pinchA = Math.max(0, 1 - pinchD / PINCH_OFF);
+  if (pinchA > 0.05) {
+    ctx.strokeStyle = `rgba(0,255,255,${(pinchA * 0.9).toFixed(2)})`;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(ix, iy); ctx.stroke();
+    ctx.setLineDash([]);
+    // Midpoint glow dot
+    const mx = (tx + ix) / 2, my = (ty + iy) / 2;
+    ctx.beginPath();
+    ctx.arc(mx, my, 5 * pinchA, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0,255,255,${(pinchA * 0.8).toFixed(2)})`;
+    ctx.fill();
+  }
+
+  // Fist ring around palm center
+  if (leftFisting) {
+    const cx = lsX(pc), cy = lsY(pc);
+    const ring = ps * W * 0.55;
+    ctx.beginPath();
+    ctx.arc(cx, cy, ring, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255,120,0,0.45)`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Gesture label
+  const lx = lsX(hand[0]) - 6;
+  const ly = lsY(hand[0]) + 18;
+  ctx.font = '9px monospace';
+  ctx.fillStyle = jointColor + '0.7)';
+  if (leftFisting)       ctx.fillText('HOLD', lx, ly);
+  else if (leftPinching) ctx.fillText('GRAB', lx, ly);
+  else                   ctx.fillText('LEFT', lx, ly);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MEDIAPIPE onResults
+// ═══════════════════════════════════════════════════════════════════════════════
+function onResults(res) {
+  // MediaPipe rightHandLandmarks = anatomically right hand.
+  // After mirror (lsX uses 1-lm.x), right hand appears on screen-right.
+  const rightHand = res.rightHandLandmarks || null;
+  const leftHand  = res.leftHandLandmarks  || null;
+  mpHands = { rightHand, leftHand };
+  mpPose  = res.poseLandmarks || null;
+
+  if (!rightHand) {
+    snapSM.phase = 'IDLE';
+    fistCount    = 0;
+    return;
+  }
+
+  const ps = palmSz(rightHand);
+  const pc = palmCtr(rightHand);
+
+  // Raw target position: palm center, floated above by ~half palm width
+  gxRaw      = s2tx(lsX(pc));
+  gyRaw      = s2ty(lsY(pc)) + ps * W * 0.55;
+  globeRadius = ps * W * 0.44 * zoomScale;
+
+  if (globeState === 'IDLE') {
+    if (detectSnap(rightHand, ps)) {
+      globeState         = 'ACTIVE';
+      globeGroup.visible = true;
+      fistCount          = 0;
+      const sx = lsX(rightHand[12]), sy = lsY(rightHand[12]);
+      sparks = {
+        x: sx, y: sy, life: 1,
+        pts: Array.from({ length: 32 }, () => ({
+          vx: (rnd() - 0.5) * 12,
+          vy: (rnd() - 0.5) * 12 - 2,
+          life: rnd() * 0.4 + 0.6,
+        })),
+      };
+    }
+  } else {
+    // Despawn: right hand fist (with hysteresis)
+    if (isFist(rightHand, pc, ps)) {
+      if (++fistCount > FIST_FRAMES) { globeState = 'IDLE'; fistCount = 0; }
+    } else {
+      fistCount = 0;
+    }
+  }
+
+  // Left hand: always process (skeleton + controls)
+  processLeftHand(leftHand, leftHand ? palmSz(leftHand) : 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  2D FX DRAW  (webcam + sparks + HUD overlays)
+// ═══════════════════════════════════════════════════════════════════════════════
+function drawFx() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Mirrored webcam feed
+  ctx.save();
+  ctx.scale(-1, 1);
+  ctx.translate(-W, 0);
+  ctx.drawImage(vid, 0, 0, W, H);
+  ctx.restore();
+
+  // ── Spark burst on snap ──────────────────────────────────────────────────
+  if (sparks) {
+    sparks.life -= 0.032;
+    if (sparks.life <= 0) {
+      sparks = null;
+    } else {
+      const age = 1 - sparks.life;
+      for (const p of sparks.pts) {
+        p.vx *= 0.88;
+        p.vy  = p.vy * 0.88 + 0.2;
+        const px = sparks.x + p.vx * age * 28;
+        const py = sparks.y + p.vy * age * 28;
+        const a  = (sparks.life * p.life).toFixed(2);
+        ctx.fillStyle = `rgba(0,255,255,${a})`;
+        ctx.fillRect(px - 1.5, py - 1.5, 3, 3);
+      }
+    }
+  }
+
+  // ── Left hand skeleton (always visible when hand detected) ──────────────
+  drawLeftHand(mpHands?.leftHand ?? null);
+
+  // ── Globe-related overlays (only when visible) ───────────────────────────
+  if (globeOpacity > 0.04) {
+    const gsx = gx + W * 0.5;   // globe screen x
+    const gsy = H * 0.5 - gy;   // globe screen y
+    const r   = globeRadius;
+
+    // Palm connection beam (cone from palm to globe base)
+    if (mpHands?.rightHand) {
+      const pc = palmCtr(mpHands.rightHand);
+      const px = lsX(pc), py = lsY(pc);
+      const bg = ctx.createLinearGradient(px, py, gsx, gsy + r);
+      bg.addColorStop(0, 'rgba(0,200,255,0)');
+      bg.addColorStop(1, `rgba(0,200,255,${(globeOpacity * 0.22).toFixed(2)})`);
+      ctx.beginPath();
+      ctx.moveTo(px - 7, py); ctx.lineTo(px + 7, py);
+      ctx.lineTo(gsx + 7, gsy + r); ctx.lineTo(gsx - 7, gsy + r);
+      ctx.fillStyle = bg;
+      ctx.fill();
+    }
+
+    // Scan line (travels top → bottom across globe, clipped to circle)
+    scanT = (scanT + 0.012) % 1;
+    const sly = gsy - r + scanT * r * 2;
+    const halfW = Math.sqrt(Math.max(0, r * r - (sly - gsy) ** 2));
+    if (halfW > 0) {
+      const sg = ctx.createLinearGradient(gsx - halfW, sly, gsx + halfW, sly);
+      sg.addColorStop(0,   'rgba(0,255,255,0)');
+      sg.addColorStop(0.5, `rgba(0,255,255,${(globeOpacity * 0.30).toFixed(2)})`);
+      sg.addColorStop(1,   'rgba(0,255,255,0)');
+      ctx.fillStyle = sg;
+      ctx.fillRect(gsx - halfW, sly - 1.5, halfW * 2, 3);
+    }
+
+    // Floor projection (soft ellipse below globe)
+    const fpY = gsy + r + 6;
+    const fg = ctx.createRadialGradient(gsx, fpY, 0, gsx, fpY, r * 0.65);
+    fg.addColorStop(0, `rgba(0,180,255,${(globeOpacity * 0.14).toFixed(2)})`);
+    fg.addColorStop(1, 'rgba(0,180,255,0)');
+    ctx.save();
+    ctx.scale(1, 0.22);
+    ctx.beginPath();
+    ctx.arc(gsx, fpY / 0.22, r * 0.65, 0, Math.PI * 2);
+    ctx.fillStyle = fg;
+    ctx.fill();
+    ctx.restore();
+
+    // Corner bracket markers
+    const cm = 13;
+    ctx.strokeStyle = `rgba(0,255,255,${(globeOpacity * 0.55).toFixed(2)})`;
+    ctx.lineWidth = 1.5;
+    for (const [cx, cy, dx, dy] of [
+      [gsx - r, gsy - r,  1,  1], [gsx + r, gsy - r, -1,  1],
+      [gsx - r, gsy + r,  1, -1], [gsx + r, gsy + r, -1, -1],
+    ]) {
+      ctx.beginPath();
+      ctx.moveTo(cx + dx * cm, cy);
+      ctx.lineTo(cx, cy);
+      ctx.lineTo(cx, cy + dy * cm);
+      ctx.stroke();
+    }
+
+    // HUD data panel (right of globe)
+    const hx = gsx + r + 20;
+    const hy = gsy - 30;
+    const lat = ((globeEuler.x * 57.3) % 90).toFixed(1);
+    const lon = ((globeEuler.y * 57.3) % 180).toFixed(1);
+    const hudLines = [
+      `LAT  ${lat}°`,
+      `LON  ${lon}°`,
+      `ZOOM ${zoomScale.toFixed(1)}×`,
+      autoSpin ? '▶ AUTO' : '⏸ HOLD',
+    ];
+    ctx.font = '10px monospace';
+    hudLines.forEach((line, i) => {
+      const a = (globeOpacity * (i === 3 ? 0.50 : 0.70)).toFixed(2);
+      ctx.fillStyle = `rgba(0,220,255,${a})`;
+      ctx.fillText(line, hx, hy + i * 15);
+    });
+    // Left bracket decoration
+    ctx.strokeStyle = `rgba(0,255,255,${(globeOpacity * 0.25).toFixed(2)})`;
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(hx - 5, hy - 12);
+    ctx.lineTo(hx - 9, hy - 12);
+    ctx.lineTo(hx - 9, hy + 48);
+    ctx.lineTo(hx - 5, hy + 48);
+    ctx.stroke();
+  }
+
+  // ── Global status bar ────────────────────────────────────────────────────
+  ctx.fillStyle = 'rgba(0,255,255,0.40)';
+  ctx.font = '10px monospace';
+  ctx.fillText('HOLOWORLD  v1.0', 14, 20);
+  const statusTxt = globeState === 'ACTIVE' ? '● GLOBE ACTIVE' : '○ SNAP RIGHT HAND TO SPAWN';
+  ctx.fillText(statusTxt, 14, H - 14);
+
+  frameN++;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  THREE.JS UPDATE  (globe animation + orbit particles)
+// ═══════════════════════════════════════════════════════════════════════════════
+let threeT = 0;
+
+function updateThree() {
+  threeT++;
+
+  // Fade opacity
+  const targetO = globeState === 'ACTIVE' ? 1 : 0;
+  const lerpO   = targetO > globeOpacity ? 0.07 : 0.055;
+  globeOpacity += (targetO - globeOpacity) * lerpO;
+  if (globeOpacity < 0.001 && globeState === 'IDLE') globeGroup.visible = false;
+
+  // Smooth world position
+  gx += (gxRaw - gx) * LERP_POS;
+  gy += (gyRaw - gy) * LERP_POS;
+  globeGroup.position.set(gx, gy, 0);
+
+  // Spawn scale animation
+  const targetS = globeState === 'ACTIVE' ? globeRadius : 0;
+  const curS    = globeGroup.scale.x;
+  globeGroup.scale.setScalar(curS + (targetS - curS) * 0.10);
+
+  // Rotation
+  if (autoSpin) globeEuler.y += AUTO_SPIN_RATE;
+  globeGroup.rotation.x = globeEuler.x;
+  globeGroup.rotation.y = globeEuler.y;
+
+  // Pulse equatorial ring
+  const pulse = 0.40 + 0.18 * sinL(threeT * 0.04);
+
+  // Update all material opacities
+  const o = globeOpacity;
+  sphereMat.opacity  = o * 0.88;
+  haloMat.opacity    = o * 0.20;
+  gridMat.opacity    = o * 0.22;
+  eqRingMat.opacity  = o * pulse;
+  ring1Mat.opacity   = o * 0.32;
+  ring2Mat.opacity   = o * 0.28;
+  orbMat.opacity     = o * 0.72;
+  // Pin mat is not transparent so skip opacity
+
+  // Orbit ring slow counter-spin
+  const children = globeGroup.children;
+  // Find torus rings by type and animate them independently
+  // (simpler: just rotate them by index after known offset)
+  // Offset: sphere(0), halo(1), grid(2), eqRing(3), ring1(4), ring2(5), orbPts(6), pinGroup(7)
+  if (children[4]) children[4].rotation.y += 0.007;
+  if (children[5]) children[5].rotation.z += 0.005;
+
+  // Orbit particle positions
+  const posAttr = orbGeo.attributes.position;
+  for (let i = 0; i < ORB_COUNT; i++) {
+    orbPhase[i] += orbSpeed[i];
+    const ph = orbPhase[i], th = orbTheta[i], rr = orbRad[i];
+    posAttr.setXYZ(i,
+      rr * Math.sin(ph) * Math.cos(th),
+      rr * Math.cos(ph),
+      rr * Math.sin(ph) * Math.sin(th),
+    );
+  }
+  posAttr.needsUpdate = true;
+
+  renderer.render(scene, threeCamera);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════════════════════════════
+function loop() {
+  drawFx();
+  updateThree();
+  requestAnimationFrame(loop);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  START  — MediaPipe + camera init
+// ═══════════════════════════════════════════════════════════════════════════════
+async function startEngines() {
+  document.getElementById('start-btn').disabled = true;
+  statusEl.textContent = 'LOADING MODELS...';
+
+  resize();
+
+  const holistic = new Holistic({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/holistic/${f}`,
+  });
+  holistic.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    refineFaceLandmarks: false,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+  holistic.onResults(onResults);
+
+  const mpCamera = new Camera(vid, {
+    onFrame: async () => { await holistic.send({ image: vid }); },
+    width: 1280, height: 720,
+  });
+
+  try {
+    await mpCamera.start();
+    statusEl.textContent = 'READY';
+    setTimeout(() => { uiEl.style.display = 'none'; }, 900);
+    loop();
+  } catch (err) {
+    statusEl.textContent = 'ERROR: ' + err.message;
+    document.getElementById('start-btn').disabled = false;
+  }
+}
+
+document.getElementById('start-btn').addEventListener('click', startEngines);
+</script>
+</body>
+</html>
